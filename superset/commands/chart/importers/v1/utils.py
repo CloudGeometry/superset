@@ -28,6 +28,9 @@ from superset.commands.chart.query_context_builder import (
     bind_slice_id,
     build_query_context_config,
 )
+from superset.commands.chart.query_context_generator import (
+    get_query_context_generator,
+)
 from superset.commands.exceptions import ImportFailedError
 from superset.commands.importers.v1.utils import (
     apply_extra_import_fields,
@@ -175,12 +178,15 @@ def _synthesize_query_context_if_absent(config: dict[str, Any]) -> bool:
     on an ABSENT context so an existing/remapped one is never overwritten
     (FR-006); mutates ``config`` in place and returns whether it synthesized one.
 
-    The context is derived from the chart's (migrated) ``params`` + the
-    importer-resolved datasource by the canonical server-side form-data builder
-    (``build_query_context_config`` -> ``build_query_context_from_form_data``,
-    the same mapping the read path, the Excel export and the MCP service use),
-    so it reproduces the chart's real ``buildQuery`` output rather than an
-    approximation. The datasource is the importer-resolved id/type ONLY, never a
+    Two-tier derivation:
+      1. AUTHORITATIVE — run the chart's real frontend ``buildQuery`` in V8
+         (``get_query_context_generator``) for byte-faithful parity with the UI.
+      2. FALLBACK — the canonical server-side form-data builder
+         (``build_query_context_config`` -> ``build_query_context_from_form_data``,
+         the same mapping the read path, the Excel export and the MCP service
+         use) when the V8 bundle / py_mini_racer is unavailable or the viz type
+         is not covered by the bundle.
+    Either way the datasource is the importer-resolved id/type ONLY, never a
     value carried in params (ADR-014 authz/RLS), and the exported ``slice_id`` is
     dropped so the context binds to no foreign chart (the new row's own id is
     bound afterwards by ``_bind_synthesized_slice_id``). A per-chart derivation
@@ -199,12 +205,27 @@ def _synthesize_query_context_if_absent(config: dict[str, Any]) -> bool:
             except (json.JSONDecodeError, TypeError):
                 params = {}
 
-        query_context_config = build_query_context_config(
-            params,
-            config["viz_type"],
-            config.get("datasource_id"),
-            config.get("datasource_type", "table"),
-        )
+        viz_type = config["viz_type"]
+        datasource_id = config.get("datasource_id")
+        datasource_type = config.get("datasource_type", "table")
+
+        query_context_config = None
+        if datasource_id:
+            # form_data for the JS builder: the datasource is the resolved
+            # id/type only (never trust params.datasource; ADR-014) and the
+            # exported slice_id is dropped before generation.
+            js_params = {
+                **params,
+                "datasource": f"{datasource_id}__{datasource_type}",
+            }
+            js_params.pop("slice_id", None)
+            query_context_config = get_query_context_generator().generate(
+                viz_type, js_params
+            )
+        if query_context_config is None:
+            query_context_config = build_query_context_config(
+                params, viz_type, datasource_id, datasource_type
+            )
 
         if query_context_config is not None:
             config["query_context"] = json.dumps(query_context_config)
